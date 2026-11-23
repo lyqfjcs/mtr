@@ -182,7 +182,8 @@ static char *ipinfo_lookup(
 
     return xstrdup(UNKN);
 #else
-    unsigned char answer[PACKETSZ], *pt;
+    unsigned char answer[PACKETSZ], *pt, *end;
+    HEADER hdr;
     char host[128];
     char *txt;
     int len, exp, size, txtlen, type;
@@ -200,17 +201,36 @@ static char *ipinfo_lookup(
         return xstrdup(UNKN);
     }
     // Clip len to PACKETSZ. -- Michał Majchrowicz
-    if (len > PACKETSZ) len = PACKETSZ;
+    if (len > PACKETSZ)
+        len = PACKETSZ;
 
+    if (len < (int) sizeof(HEADER)) {
+        printf("@Broken DNS reply.\n");
+        return NULL;
+    }
+
+    memcpy(&hdr, answer, sizeof(hdr));
+    if (ntohs(hdr.qdcount) != 1 || ntohs(hdr.ancount) < 1) {
+        printf("@Broken DNS reply.\n");
+        return NULL;
+    }
+
+    end = answer + len;
     pt = answer + sizeof(HEADER);
 
-    if ((exp =
-         dn_expand(answer, answer + len, pt, host, sizeof(host))) < 0) {
+    if (pt >= end ||
+        (exp = dn_expand(answer, end, pt, host, sizeof(host))) < 0 ||
+        exp > end - pt) {
         printf("@dn_expand failed\n");
         return NULL;
     }
 
     pt += exp;
+
+    if (end - pt < INT16SZ + INT16SZ) {
+        printf("@Broken DNS reply.\n");
+        return NULL;
+    }
 
     GETSHORT(type, pt);
     if (type != T_TXT) {
@@ -220,13 +240,20 @@ static char *ipinfo_lookup(
 
     pt += INT16SZ;              /* class */
 
-    if ((exp =
-         dn_expand(answer, answer + len, pt, host, sizeof(host))) < 0) {
+    if (pt >= end ||
+        (exp = dn_expand(answer, end, pt, host, sizeof(host))) < 0 ||
+        exp > end - pt) {
         printf("@second dn_expand failed\n");
         return NULL;
     }
 
     pt += exp;
+
+    if (end - pt < 3 * INT16SZ + INT32SZ) {
+        printf("@Broken DNS reply.\n");
+        return NULL;
+    }
+
     GETSHORT(type, pt);
     if (type != T_TXT) {
         printf("@Not a TXT record\n");
@@ -236,8 +263,13 @@ static char *ipinfo_lookup(
     pt += INT16SZ;              /* class */
     pt += INT32SZ;              /* ttl */
     GETSHORT(size, pt);
-    txtlen = *pt;
 
+    if (size < 1 || size > end - pt) {
+        printf("@Broken TXT record (size = %d)\n", size);
+        return NULL;
+    }
+
+    txtlen = *pt;
 
     if (txtlen >= size || !txtlen) {
         printf("@Broken TXT record (txtlen = %d, size = %d)\n", txtlen,
@@ -254,7 +286,8 @@ static char *ipinfo_lookup(
         txt = (char *) txtrec;
 
     pt++;
-    xstrncpy(txt, (char *) pt, txtlen + 1);
+    memcpy(txt, pt, txtlen);
+    txt[txtlen] = '\0';
 
     if (iihash)
         DEB_syslog(LOG_INFO, "Malloc-txt(%p): %s", txt, txt);
